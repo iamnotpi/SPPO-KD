@@ -28,7 +28,7 @@ for i in $(seq 1 $iter_num); do
         --gpu 0 \
         --use_teacher_llm \
         --teacher_model Qwen/Qwen1.5-1.8B \
-        --use_contextual_scoring \
+        --batch_size 8 \
         --bt_conversion_method bradley_terry_mle
     
     echo "Computing probabilities and preparing dataset..."
