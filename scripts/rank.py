@@ -105,23 +105,6 @@ def simulate_pairwise_from_scores(absolute_scores, method="bradley_terry_mle"):
         avg_win_prob = np.clip(avg_win_prob, epsilon, 1 - epsilon)
         bt_scores = np.log(avg_win_prob / (1 - avg_win_prob))
         
-    elif method == "elo_simulation":
-        n = len(scores)
-        elo_ratings = scores * 100  # Scale up scores
-        
-        for i in range(n):
-            for j in range(i + 1, n):
-                expected_i = 1 / (1 + 10**((elo_ratings[j] - elo_ratings[i]) / 400))
-                
-                actual_i = 1 if scores[i] > scores[j] else 0 if scores[i] < scores[j] else 0.5
-                
-                K = 32  # K-factor
-                elo_ratings[i] += K * (actual_i - expected_i)
-                elo_ratings[j] += K * ((1 - actual_i) - (1 - expected_i))
-        
-        bt_scores = elo_ratings / 400
-        bt_scores = bt_scores - np.mean(bt_scores)
-        
     elif method == "percentile_ranking":
         from scipy.stats import rankdata
         ranks = rankdata(scores, method='average')
@@ -148,9 +131,8 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
         batch_prompts = prompts[i:i+batch_size]
         batch_responses = all_responses[i:i+batch_size]
         
-        # Create all scoring prompts for this batch
         batch_scoring_prompts = []
-        batch_indices = []  # Track which prompt/response each scoring prompt belongs to
+        batch_indices = []
         
         for batch_idx, (prompt, responses) in enumerate(zip(batch_prompts, batch_responses)):
             for response_idx, response in enumerate(responses):
@@ -161,7 +143,6 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
         if not batch_scoring_prompts:
             continue
             
-        # Tokenize entire batch
         inputs = tokenizer(
             batch_scoring_prompts, 
             return_tensors="pt", 
@@ -170,7 +151,6 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
             max_length=max_length
         ).to(device)
         
-        # Generate scores for entire batch
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
@@ -180,14 +160,11 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
                 pad_token_id=tokenizer.eos_token_id
             )
         
-        # Extract scores from batch outputs
         batch_scores = []
         for j, (batch_idx, response_idx) in enumerate(batch_indices):
-            # Decode only the generated part (skip the input)
             input_length = inputs.input_ids[j].shape[0]
             generated_text = tokenizer.decode(outputs[j][input_length:], skip_special_tokens=True)
             
-            # Extract numerical score
             score_match = re.search(r'(\d+\.?\d*)', generated_text)
             if score_match:
                 score = float(score_match.group(1))
@@ -196,7 +173,6 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
                 print(f"Warning: Could not parse score from response: {generated_text}")
                 batch_scores.append(5.0)
         
-        # Organize scores back into the original structure
         current_prompt_scores = []
         current_prompt_idx = 0
         
@@ -207,7 +183,6 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
                 current_prompt_idx = batch_idx
             current_prompt_scores.append(batch_scores[j])
         
-        # Don't forget the last prompt's scores
         if current_prompt_scores:
             all_scores.append(current_prompt_scores)
     
@@ -232,10 +207,8 @@ def score_with_teacher_llm(prompts, candidates, teacher_model, batch_size=4, tem
     
     model.eval()
     
-    # Use batched scoring for efficiency
     absolute_scores_list = score_with_teacher(prompts, candidates, model, tokenizer, device, batch_size=batch_size)
     
-    # Convert to Bradley-Terry format
     all_scores = []
     for absolute_scores in absolute_scores_list:
         bt_scores = simulate_pairwise_from_scores(absolute_scores, method=bt_method)
