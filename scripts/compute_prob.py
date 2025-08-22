@@ -11,10 +11,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="generated/iter1")
     parser.add_argument("--pairs", type=int, default=5)
-    parser.add_argument("--prompts", type=str, default="UCLA-AGI/data-mistral-7b-instruct-sppo-iter1")
+    parser.add_argument("--prompts", type=str, default="d:/Python/GenAI/DSKD/data/dolly/train.jsonl")
     parser.add_argument("--frac_len", type=int, default=0)
     parser.add_argument("--num_gpu", type=int, default=8)
-    parser.add_argument("--org", type=str, default="UCLA-AGI")
+    parser.add_argument("--org", type=str, default="local")
     parser.add_argument("--gpu_ids", type=str, default=None)
     return parser.parse_args()
 
@@ -131,8 +131,8 @@ def push_dataset(file_dir, org):
         test = train.sample(n=500)
         test.to_parquet(f"{file_dir}/test.parquet", index=False)
         test = Dataset.from_parquet(f"{file_dir}/test.parquet")
-    data.push_to_hub(f"{org}/{file_dir}", split="train", private=True)
-    test.push_to_hub(f"{org}/{file_dir}", split="test", private=True)
+    # data.push_to_hub(f"{org}/{file_dir}", split="train", private=True)
+    # test.push_to_hub(f"{org}/{file_dir}", split="test", private=True)
 
 
 
@@ -140,6 +140,7 @@ if __name__ == "__main__":
     args = parse_arguments()
     from_ranks(args)
     data = Dataset.from_parquet(f"generated/{args.output_dir}/train.parquet")
-    data.push_to_hub(f"{args.org}/{args.output_dir}_generated", private=True)
+    # data.push_to_hub(f"{args.org}/{args.output_dir}_generated", private=True)
+    print(f"Generated data saved locally to generated/{args.output_dir}/")
     out_path = prepare_score(args)
     push_dataset(out_path, args.org)

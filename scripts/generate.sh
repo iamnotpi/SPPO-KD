@@ -3,14 +3,14 @@ set -x
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 AVAILABLE_GPUS=(0 1 2 3 4 5 6 7)
-HF_ORG=UCLA-AGI
+# HF_ORG=UCLA-AGI
 
 MODEL="mistralai/Mistral-7B-Instruct-v0.2"
 OUTDIR="data-mistral-7b-instruct-sppo-iter1"
 
 PAIRS=5
 FRAC=0
-PROMPTS="UCLA-AGI/data-mistral-7b-instruct-sppo-iter1"
+PROMPTS="d:/Python/GenAI/DSKD/data/dolly/train.jsonl"
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -85,4 +85,4 @@ all_rank=$!
 
 wait $all_rank
 
-python3 scripts/compute_prob.py --org $HF_ORG --gpu_ids "$(IFS=, ; echo "${AVAILABLE_GPUS[*]}")" --output_dir $OUTDIR --pairs $PAIRS --frac_len $FRAC_LEN --prompts $PROMPTS
+python3 scripts/compute_prob.py --gpu_ids "$(IFS=, ; echo "${AVAILABLE_GPUS[*]}")" --output_dir $OUTDIR --pairs $PAIRS --frac_len $FRAC_LEN --prompts $PROMPTS

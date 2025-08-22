@@ -5,7 +5,9 @@ import argparse
 import llm_blender
 import os
 import numpy as np
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from tqdm import tqdm
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -15,18 +17,300 @@ def parse_arguments():
     )
     parser.add_argument('--output_dir', type=str, default='generated/iter1')
     parser.add_argument("--numgpu", type=int, default=8)
-    parser.add_argument('--prompts', type=str, default='UCLA-AGI/data-mistral-7b-instruct-sppo-iter1')
+    parser.add_argument('--prompts', type=str, default='d:/Python/GenAI/DSKD/data/dolly/train.jsonl')
     parser.add_argument('--data_frac', type=int, default=0)
     parser.add_argument('--frac_len', type=int, default=0)
     parser.add_argument("--gpu", type=int, default=0)  # local rank
     parser.add_argument("--pairs", type=int, default=5)
+    parser.add_argument("--use_teacher_llm", action="store_true", help="Use teacher LLM instead of PairRM")
+    parser.add_argument("--teacher_model", type=str, default="mistralai/Mistral-7B-Instruct-v0.2", help="Teacher model for scoring (HuggingFace model)")
+    parser.add_argument("--scoring_prompt_template", type=str, default=None, help="Path to scoring prompt template")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for teacher LLM scoring")
+    
+    # New arguments for improved scoring
+    parser.add_argument("--use_contextual_scoring", action="store_true", 
+                       help="Include other responses as context when scoring (O(n) but more accurate)")
+    parser.add_argument("--bt_conversion_method", type=str, default="bradley_terry_mle",
+                       choices=["bradley_terry_mle", "score_difference", "elo_simulation", "percentile_ranking"],
+                       help="Method to convert absolute scores to Bradley-Terry format")
+    
     return parser.parse_args()
 
+def create_scoring_prompt(prompt, response, template_path=None):
+    """Create a scoring prompt for the teacher LLM."""
+    if template_path and os.path.exists(template_path):
+        with open(template_path, 'r') as f:
+            template = f.read()
+        return template.format(prompt=prompt, response=response)
+
+    return f"""Please evaluate the following response to the given prompt on a scale from 1 to 10, where 1 is very poor and 10 is excellent.
+
+Consider the following criteria:
+- Helpfulness and relevance to the prompt
+- Accuracy and correctness
+- Clarity and coherence
+- Completeness of the response
+
+Prompt: {prompt}
+
+Response: {response}
+
+Please provide only a numerical score between 1 and 10. Do not include any other text or explanation.
+
+Score:"""
+
+def create_scoring_prompt_with_context(prompt, response, all_responses, template_path=None):
+    """Create a scoring prompt that includes context of other responses for relative judgment."""
+    if template_path and os.path.exists(template_path):
+        with open(template_path, 'r') as f:
+            template = f.read()
+        return template.format(prompt=prompt, response=response, all_responses=all_responses)
+    
+    other_responses = [r[:200] + "..." if len(r) > 200 else r for r in all_responses if r != response]
+    context = "\n\n".join([f"Reference Response {i+1}: {resp}" for i, resp in enumerate(other_responses[:3])])
+    
+    return f"""Please evaluate the following response to the given prompt on a scale from 1 to 10, considering how it compares to the reference responses shown below.
+
+Consider the following criteria:
+- Helpfulness and relevance to the prompt
+- Accuracy and correctness
+- Clarity and coherence
+- Completeness of the response
+
+Prompt: {prompt}
+
+Reference Responses:
+{context}
+
+Response to Evaluate: {response}
+
+Rate this response from 1-10 compared to the reference responses. A score of 5-6 means it's about average compared to the references, 1-4 means it's worse, and 7-10 means it's better.
+
+Please provide only a numerical score between 1 and 10.
+
+Score:"""
+
+def simulate_pairwise_from_scores(absolute_scores, method="bradley_terry_mle"):
+    """
+    Simulate pairwise comparison results from absolute scores using various methods.
+    
+    Args:
+        absolute_scores: Array of absolute scores for responses
+        method: Method to use for simulation
+    
+    Returns:
+        Array of Bradley-Terry compatible scores
+    """
+    scores = np.array(absolute_scores, dtype=float)
+    
+    if method == "bradley_terry_mle":
+        temperature = 1.0
+        exp_scores = np.exp(scores / temperature)
+        probabilities = exp_scores / np.sum(exp_scores)
+        
+        epsilon = 1e-10
+        probabilities = np.clip(probabilities, epsilon, 1 - epsilon)
+        bt_scores = np.log(probabilities)
+        
+        bt_scores = bt_scores - np.mean(bt_scores)
+        
+    elif method == "score_difference":
+        n = len(scores)
+        pairwise_probs = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    score_diff = scores[i] - scores[j]
+                    pairwise_probs[i][j] = 1 / (1 + np.exp(-score_diff))
+        
+        avg_win_prob = np.mean(pairwise_probs, axis=1)
+        
+        epsilon = 1e-10
+        avg_win_prob = np.clip(avg_win_prob, epsilon, 1 - epsilon)
+        bt_scores = np.log(avg_win_prob / (1 - avg_win_prob))
+        
+    elif method == "elo_simulation":
+        n = len(scores)
+        elo_ratings = scores * 100  # Scale up scores
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                expected_i = 1 / (1 + 10**((elo_ratings[j] - elo_ratings[i]) / 400))
+                
+                actual_i = 1 if scores[i] > scores[j] else 0 if scores[i] < scores[j] else 0.5
+                
+                K = 32  # K-factor
+                elo_ratings[i] += K * (actual_i - expected_i)
+                elo_ratings[j] += K * ((1 - actual_i) - (1 - expected_i))
+        
+        bt_scores = elo_ratings / 400
+        bt_scores = bt_scores - np.mean(bt_scores)
+        
+    elif method == "percentile_ranking":
+        # Convert to percentile ranks then to Bradley-Terry
+        from scipy.stats import rankdata
+        ranks = rankdata(scores, method='average')
+        percentiles = (ranks - 1) / (len(scores) - 1)
+        
+        # Convert percentiles to log-odds
+        epsilon = 1e-10
+        percentiles = np.clip(percentiles, epsilon, 1 - epsilon)
+        bt_scores = np.log(percentiles / (1 - percentiles))
+        
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    return bt_scores
+
+def score_with_local_teacher(prompt, responses, model, tokenizer, device="cuda", max_length=512):
+    """Score responses using a local HuggingFace model."""
+    import re
+
+    scores = []
+
+    for response in responses:
+        scoring_prompt = create_scoring_prompt(prompt, response)
+
+        inputs = tokenizer(scoring_prompt, return_tensors="pt", truncation=True, max_length=max_length).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=50,
+                temperature=0.1,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+        # Decode the generated text
+        generated_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+
+        # Extract numerical score
+        score_match = re.search(r'(\d+\.?\d*)', generated_text)
+        if score_match:
+            score = float(score_match.group(1))
+            scores.append(score)
+        else:
+            print(f"Warning: Could not parse score from response: {generated_text}")
+            scores.append(5.0)
+
+    return scores
+
+def score_with_contextual_teacher(prompt, responses, model, tokenizer, device="cuda", max_length=1024):
+    """Score responses using contextual absolute scoring that considers other responses."""
+    import re
+    
+    scores = []
+    
+    for response in responses:
+        scoring_prompt = create_scoring_prompt_with_context(prompt, response, responses)
+        
+        inputs = tokenizer(scoring_prompt, return_tensors="pt", truncation=True, max_length=max_length).to(device)
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=10,
+                temperature=0.1,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        generated_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        
+        # Extract numerical score
+        score_match = re.search(r'(\d+\.?\d*)', generated_text)
+        if score_match:
+            score = float(score_match.group(1))
+            scores.append(score)
+        else:
+            print(f"Warning: Could not parse score from response: {generated_text}")
+            scores.append(5.0)
+    
+    return scores
+
+def score_with_teacher_llm(prompts, candidates, teacher_model, batch_size=4, template_path=None):
+    """Score responses using a teacher LLM."""
+    print(f"Scoring {len(prompts)} prompts with {len(candidates[0])} candidates each using {teacher_model}")
+    print(f"Loading local teacher model: {teacher_model}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(teacher_model, torch_dtype=torch.float16).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(teacher_model)
+        tokenizer.pad_token = tokenizer.eos_token
+    except Exception as e:
+        print(f"Error loading model {teacher_model}: {e}")
+        raise
+
+    model.eval()
+    all_scores = []
+
+    for i, (prompt, candidate_list) in enumerate(tqdm(zip(prompts, candidates), desc="Scoring with local model")):
+        prompt_scores = score_with_local_teacher(prompt, candidate_list, model, tokenizer, device)
+        all_scores.append(prompt_scores)
+
+    return np.array(all_scores)
+
+def score_with_teacher_llm_contextual(prompts, candidates, teacher_model, batch_size=4, template_path=None, bt_method="bradley_terry_mle"):
+    """Score responses using contextual absolute scoring then convert to Bradley-Terry format."""
+    print(f"Scoring {len(prompts)} prompts with contextual scoring using {teacher_model}")
+    print(f"Bradley-Terry conversion method: {bt_method}")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    try:
+        model = AutoModelForCausalLM.from_pretrained(teacher_model).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(teacher_model)
+        tokenizer.pad_token = tokenizer.eos_token
+    except Exception as e:
+        print(f"Error loading model {teacher_model}: {e}")
+        raise
+    
+    model.eval()
+    all_scores = []
+    
+    for i, (prompt, candidate_list) in enumerate(tqdm(zip(prompts, candidates), desc="Contextual scoring")):
+        absolute_scores = score_with_contextual_teacher(prompt, candidate_list, model, tokenizer, device)
+        
+        bt_scores = simulate_pairwise_from_scores(absolute_scores, method=bt_method)
+        all_scores.append(bt_scores)
+    
+    return np.array(all_scores)
+
+
 def ranking(args, prompts, candidates):
-    blender = llm_blender.Blender()
-    blender.loadranker("llm-blender/PairRM")
-    ranks = blender.rank(prompts, candidates, return_scores=True, batch_size=1)
-    np.save(f"ranking/{args.output_dir}/{args.gpu}_{args.data_frac}.npy", ranks)
+    """Rank responses using either PairRM or teacher LLM with various strategies."""
+    if args.use_teacher_llm:
+        if hasattr(args, 'use_contextual_scoring') and args.use_contextual_scoring:
+            scores = score_with_teacher_llm_contextual(
+                prompts,
+                candidates,
+                args.teacher_model,
+                args.batch_size,
+                args.scoring_prompt_template,
+                getattr(args, 'bt_conversion_method', 'bradley_terry_mle')
+            )
+        else:
+            absolute_scores = score_with_teacher_llm(
+                prompts,
+                candidates,
+                args.teacher_model,
+                args.batch_size,
+                args.scoring_prompt_template
+            )
+            
+            bt_method = getattr(args, 'bt_conversion_method', 'bradley_terry_mle')
+            scores = np.array([simulate_pairwise_from_scores(row_scores, method=bt_method)
+                              for row_scores in absolute_scores])
+    else:
+        blender = llm_blender.Blender()
+        blender.loadranker("llm-blender/PairRM")
+        scores = blender.rank(prompts, candidates, return_scores=True, batch_size=1)
+
+    np.save(f"ranking/{args.output_dir}/{args.gpu}_{args.data_frac}.npy", scores)
 
 
 def split_prompts(prompts, frac_len, data_frac):
