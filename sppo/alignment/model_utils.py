@@ -26,8 +26,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from accelerate import Accelerator
 from huggingface_hub import list_repo_files
-from huggingface_hub.utils._errors import RepositoryNotFoundError
-from huggingface_hub.utils._validators import HFValidationError
+from huggingface_hub.errors import RepositoryNotFoundError, HFValidationError
 from peft import LoraConfig, PeftConfig
 
 from .configs import DataArguments, SPPOConfig, ModelArguments, SFTConfig
@@ -84,7 +83,7 @@ def get_tokenizer(model_args: ModelArguments, data_args: DataArguments) -> PreTr
 
     if data_args.chat_template is not None:
         tokenizer.chat_template = data_args.chat_template
-    elif tokenizer.chat_template is None and tokenizer.default_chat_template is None:
+    elif tokenizer.chat_template is None and (not hasattr(tokenizer, 'default_chat_template') or tokenizer.default_chat_template is None):
         tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
 
     return tokenizer

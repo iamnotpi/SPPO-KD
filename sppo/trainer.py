@@ -54,6 +54,8 @@ if is_deepspeed_available():
 #     feature['chosen_probs_lose'] = chosen_probs_lose
 #     return feature
 
+
+
 class SPPOTrainer(Trainer):
     r"""
     Initialize SPPOTrainer.
@@ -296,24 +298,62 @@ class SPPOTrainer(Trainer):
             max_target_length = 128
 
         if data_collator is None:
+            # Use the standard DPO collator by default (expects pre-tokenized dataset)
             data_collator = DPODataCollatorWithPadding(
                 pad_token_id=tokenizer.pad_token_id,
                 label_pad_token_id=label_pad_token_id,
                 is_encoder_decoder=self.is_encoder_decoder,
             )
-
             if args.remove_unused_columns:
                 args.remove_unused_columns = False
-                # warn users
                 warnings.warn(
                     "When using DPODataCollatorWithPadding, you should set `remove_unused_columns=False` in your TrainingArguments"
                     " we have set it for you, but you should do it yourself in the future.",
                     UserWarning,
                 )
-
             self.use_dpo_data_collator = True
         else:
-            self.use_dpo_data_collator = False
+            # Assume a user-provided collator is compatible
+            if args.remove_unused_columns:
+                args.remove_unused_columns = False
+            # Detect whether the provided collator is a DPODataCollatorWithPadding by duck-typing on expected outputs at runtime
+            self.use_dpo_data_collator = True
+
+        # Wrap data_collator to debug incoming feature types (rank 0 only)
+        try:
+            import os as _os
+            _rank0 = _os.environ.get("LOCAL_RANK", "0") == "0"
+        except Exception:
+            _rank0 = True
+        class _DebugCollator:
+            def __init__(self, inner, enable, print_batch_size):
+                self.inner = inner
+                self.enable = enable
+                self.print_batch_size = print_batch_size
+                self._printed = False
+            def __call__(self, features):
+                # Print only on first real DataLoader call (batch size match), skip manual sanity calls
+                should_print = False
+                try:
+                    if isinstance(features, list):
+                        if self.print_batch_size is not None and len(features) == self.print_batch_size:
+                            should_print = True
+                        # Also print if first element is a str (indicates a bug)
+                        if features and isinstance(features[0], str):
+                            should_print = True
+                except Exception:
+                    should_print = True
+                if self.enable and not self._printed and should_print:
+                    try:
+                        t_first = type(features[0]) if isinstance(features, list) and features else type(features)
+                        print(f"[DEBUG] collate called: type(features)={type(features)}, first={t_first}")
+                        if isinstance(features, list) and features and isinstance(features[0], dict):
+                            print(f"[DEBUG] collate first keys: {list(features[0].keys())}")
+                    except Exception as _e:
+                        print(f"[DEBUG] collate inspect failed: {_e}")
+                    self._printed = True
+                return self.inner(features)
+        data_collator = _DebugCollator(data_collator, _rank0, getattr(args, "per_device_train_batch_size", None))
 
         if disable_dropout:
             disable_dropout_in_model(model)
@@ -327,8 +367,87 @@ class SPPOTrainer(Trainer):
         self.max_prompt_length = max_prompt_length
         self.truncation_mode = truncation_mode
         self.max_target_length = max_target_length
-        self.tokenizer = tokenizer
+        self._tokenizer = tokenizer
         self.precompute_ref_log_probs = precompute_ref_log_probs
+
+        # Tokenize datasets upfront for DPODataCollatorWithPadding
+        def _map_dataset(ds: Dataset) -> Dataset:
+            if ds is None:
+                return ds
+            # Remove raw text columns after tokenization to reduce memory
+            try:
+                column_names = list(ds.features)
+            except Exception:
+                column_names = ds.column_names
+            # Keep all original columns to avoid accidentally dropping probability annotations
+            return ds.map(
+                lambda x: self.tokenize_row(x),
+                desc="Tokenizing dataset for DPO",
+            )
+
+        if train_dataset is not None:
+            train_dataset = _map_dataset(train_dataset)
+        if isinstance(eval_dataset, dict):
+            eval_dataset = {k: _map_dataset(v) for k, v in eval_dataset.items()}
+        elif eval_dataset is not None:
+            eval_dataset = _map_dataset(eval_dataset)
+
+        # Debug: inspect mapped datasets to ensure probability fields are present (rank 0 only)
+        try:
+            import os
+            is_rank0 = os.environ.get("LOCAL_RANK", "0") == "0"
+        except Exception:
+            is_rank0 = True
+        if is_rank0:
+            def _peek_dataset(ds, name):
+                try:
+                    if ds is None:
+                        print(f"[DEBUG] {name}: None")
+                        return
+                    try:
+                        cols = list(ds.features)
+                    except Exception:
+                        cols = ds.column_names
+                    print(f"[DEBUG] {name} columns: {cols}")
+                    if len(ds) > 0:
+                        ex = ds[0]
+                        print(f"[DEBUG] {name} sample keys: {list(ex.keys())}")
+                        for pk in ["chosen_probs", "chosen_probs_win", "chosen_probs_lose"]:
+                            print(f"[DEBUG] {name} {pk}:", ex.get(pk, None))
+                        # quick sample stats on chosen_probs
+                        n = min(100, len(ds))
+                        vals = []
+                        for i in range(n):
+                            vi = ds[i].get("chosen_probs", None)
+                            if vi is not None:
+                                vals.append(vi)
+                        if vals:
+                            half = sum(1 for v in vals if v == 0.5)
+                            print(f"[DEBUG] {name} chosen_probs sample_n={len(vals)} prop_equal_0_5={half/len(vals):.3f}")
+                except Exception as _e:
+                    print(f"[DEBUG] {name} inspection failed: {_e}")
+
+            _peek_dataset(train_dataset, "train_dataset")
+            _peek_dataset(eval_dataset, "eval_dataset")
+
+            # Quick collate sanity check to ensure collator sees tokenized fields
+            try:
+                if train_dataset is not None and len(train_dataset) > 0:
+                    _n = min(8, len(train_dataset))
+                    _features = [train_dataset[i] for i in range(_n)]
+                    _batch = data_collator(_features)
+                    print(f"[DEBUG] collated keys: {list(_batch.keys())}")
+                    if "chosen_probs_win" in _batch:
+                        _vals = _batch["chosen_probs_win"]
+                        try:
+                            import numpy as _np
+                            _arr = _np.array(_vals, dtype=float)
+                            _half = float((_arr == 0.5).mean())
+                            print(f"[DEBUG] collated chosen_probs_win mean={_arr.mean():.3f} prop_equal_0_5={_half:.3f}")
+                        except Exception:
+                            print(f"[DEBUG] collated chosen_probs_win (raw): {_vals}")
+            except Exception as _e:
+                print(f"[DEBUG] collate sanity check failed: {_e}")
 
         # Since ref_logs are precomputed on the first call to get_train/eval_dataloader
         # keep track of first called to avoid computation of future calls
@@ -345,32 +464,15 @@ class SPPOTrainer(Trainer):
         self.loss_type = loss_type
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
-
-        # tokenize the dataset
-        # print('=== before map', train_dataset.features)
-        # chosen_probs = train_dataset['chosen_probs']
-        # chosen_probs_win = train_dataset['chosen_probs_win']
-        # chosen_probs_lose = train_dataset['chosen_probs_lose']
-        # old_train_dataset = train_dataset
-        train_dataset = train_dataset.map(self.tokenize_row)
-        # print('=== before add', train_dataset.features)
-        # import pandas as pd
-        # mid_dataset = pd.DataFrame(train_dataset)
-        # mid_dataset['chosen_probs'] = chosen_probs
-        # mid_dataset['chosen_probs_win'] = chosen_probs_win
-        # mid_dataset['chosen_probs_lose'] = chosen_probs_lose
-        # train_dataset = Dataset.from_pandas(mid_dataset)
-        # print('=== after add', train_dataset.features)
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(self.tokenize_row)
-        #print('=========')
+        if self._tokenizer.pad_token_id is None:
+            self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
+        # Initialize Trainer with the data collator (DPODataCollatorWithPadding by default)
         super().__init__(
             model=model,
             args=args,
             data_collator=data_collator,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
             model_init=model_init,
             compute_metrics=compute_metrics,
             callbacks=callbacks,
@@ -438,6 +540,16 @@ class SPPOTrainer(Trainer):
 
         Subclass of transformers.src.transformers.trainer.get_train_dataloader to precompute `ref_log_probs`.
         """
+        # Rank-0 debug that this method is being used and with which dataset class
+        try:
+            import os
+            if os.environ.get("LOCAL_RANK", "0") == "0":
+                ds = self.train_dataset
+                ds_type = type(ds)
+                ds_len = len(ds) if ds is not None else 0
+                print(f"[DEBUG] get_train_dataloader called: dataset={ds_type} len={ds_len} collate_fn={type(self.data_collator)}")
+        except Exception:
+            pass
 
         if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
             dataloader_params = {
@@ -473,7 +585,21 @@ class SPPOTrainer(Trainer):
 
             self._precomputed_train_ref_log_probs = True
 
-        return super().get_train_dataloader()
+        # Always construct dataloader with our collator to avoid any fallback paths
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        train_sampler = self._get_train_sampler()
+        dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=train_sampler,
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+        return self.accelerator.prepare(dataloader)
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
         """
@@ -535,8 +661,8 @@ class SPPOTrainer(Trainer):
             https://github.com/EleutherAI/lm-evaluation-harness/pull/531#issuecomment-1595586257
         """
 
-        full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
-        prompt_input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        full_tokenized = self._tokenizer(prompt + answer, add_special_tokens=False)
+        prompt_input_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
         answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
         answer_attention_mask = full_tokenized["attention_mask"][len(prompt_input_ids) :]
@@ -600,8 +726,8 @@ class SPPOTrainer(Trainer):
 
             if not isinstance(prompt, str):
                 raise ValueError(f"prompt should be an str but got {type(prompt)}")
-            prompt_tokens = self.tokenizer(prompt, add_special_tokens=False)
-            prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
+            _pt = self._tokenizer(prompt, add_special_tokens=False)
+            prompt_tokens = {f"prompt_{k}": v for k, v in _pt.items()}
 
             if not isinstance(chosen, str):
                 raise ValueError(f"chosen should be an str but got {type(chosen)}")
@@ -635,19 +761,19 @@ class SPPOTrainer(Trainer):
                 )
 
             # add BOS token to head of prompt
-            prompt_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
-            chosen_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + chosen_tokens["prompt_input_ids"]
-            rejected_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + rejected_tokens["prompt_input_ids"]
+            prompt_tokens["prompt_input_ids"] = [self._tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
+            chosen_tokens["prompt_input_ids"] = [self._tokenizer.bos_token_id] + chosen_tokens["prompt_input_ids"]
+            rejected_tokens["prompt_input_ids"] = [self._tokenizer.bos_token_id] + rejected_tokens["prompt_input_ids"]
 
             prompt_tokens["prompt_attention_mask"] = [1] + prompt_tokens["prompt_attention_mask"]
             chosen_tokens["prompt_attention_mask"] = [1] + chosen_tokens["prompt_attention_mask"]
             rejected_tokens["prompt_attention_mask"] = [1] + rejected_tokens["prompt_attention_mask"]
 
             # add EOS token to end of answer
-            chosen_tokens["input_ids"].append(self.tokenizer.eos_token_id)
+            chosen_tokens["input_ids"].append(self._tokenizer.eos_token_id)
             chosen_tokens["attention_mask"].append(1)
 
-            rejected_tokens["input_ids"].append(self.tokenizer.eos_token_id)
+            rejected_tokens["input_ids"].append(self._tokenizer.eos_token_id)
             rejected_tokens["attention_mask"].append(1)
 
             longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
@@ -696,15 +822,20 @@ class SPPOTrainer(Trainer):
                         continue
                     batch[f"{k}{type_key}"] = tokens
 
+            # Carry through optional probability annotations if present on the example
+            for prob_key in ("chosen_probs", "chosen_probs_win", "chosen_probs_lose"):
+                if prob_key in feature:
+                    batch[prob_key] = feature[prob_key]
+
 
         else:
-            chosen_tokens = self.tokenizer(
+            chosen_tokens = self._tokenizer(
                 chosen, truncation=True, max_length=self.max_target_length, add_special_tokens=True
             )
-            rejected_tokens = self.tokenizer(
+            rejected_tokens = self._tokenizer(
                 rejected, truncation=True, max_length=self.max_target_length, add_special_tokens=True
             )
-            prompt_tokens = self.tokenizer(
+            prompt_tokens = self._tokenizer(
                 prompt, truncation=True, max_length=self.max_prompt_length, add_special_tokens=True
             )
 
@@ -781,6 +912,25 @@ class SPPOTrainer(Trainer):
         """
         concatenated_batch = {}
 
+        # Check if batch is a string (data collator issue)
+        if isinstance(batch, str):
+            print(f"ERROR: Batch is a string instead of a dictionary!")
+            print(f"ERROR: String content: {batch[:200]}...")
+            raise ValueError(f"Batch is a string instead of a dictionary. Data collator is not working properly.")
+        
+        # Check if batch is a dictionary
+        if not isinstance(batch, dict):
+            print(f"ERROR: Batch is not a dictionary. Type: {type(batch)}")
+            raise ValueError(f"Expected batch to be a dictionary, but got: {type(batch)}")
+        
+        # Check if we have the expected tensor keys
+        if "chosen_input_ids" not in batch or "rejected_input_ids" not in batch:
+            print(f"ERROR: Expected 'chosen_input_ids' and 'rejected_input_ids' in batch, but got: {list(batch.keys())}")
+            print(f"ERROR: Batch type: {type(batch)}")
+            if isinstance(batch, dict):
+                print(f"ERROR: Batch content sample: {list(batch.items())[:3]}")
+            raise ValueError(f"Expected 'chosen_input_ids' and 'rejected_input_ids' in batch, but got: {list(batch.keys())}")
+        
         if is_encoder_decoder:
             max_length = max(batch["chosen_labels"].shape[1], batch["rejected_labels"].shape[1])
         else:
@@ -794,6 +944,9 @@ class SPPOTrainer(Trainer):
                     pad_value = padding_value
                 elif k.endswith("_attention_mask"):
                     pad_value = 0
+                else:
+                    # Skip non-sequence tensors such as probabilities
+                    continue
                 concatenated_key = k.replace("chosen", "concatenated")
                 concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
         for k in batch:
@@ -804,6 +957,9 @@ class SPPOTrainer(Trainer):
                     pad_value = padding_value
                 elif k.endswith("_attention_mask"):
                     pad_value = 0
+                else:
+                    # Skip non-sequence tensors such as probabilities
+                    continue
                 concatenated_key = k.replace("rejected", "concatenated")
                 concatenated_batch[concatenated_key] = torch.cat(
                     (
@@ -873,7 +1029,7 @@ class SPPOTrainer(Trainer):
         elif self.loss_type == "ipo":
             # eqn (17) of the paper where beta is the regularization parameter for the IPO loss, denoted by tau in the paper.
             losses = (logits - 1 / (2 * self.beta)) ** 2
-        elif self.loss_type == "sppo":
+        elif self.loss_type in ("sppo", "rpo"):
             loss_w = (logits_w - (1 / self.beta)*(chosen_probs_win - 0.5)) ** 2
             loss_l = (logits_l - (1 / self.beta)*(chosen_probs_lose - 0.5)) ** 2
             losses = (loss_w + loss_l)/2
@@ -962,6 +1118,9 @@ class SPPOTrainer(Trainer):
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
+        # Debug: Check batch type before concatenated_inputs
+        # Debug prints removed
+            
         concatenated_batch = self.concatenated_inputs(
             batch,
             is_encoder_decoder=self.is_encoder_decoder,
@@ -1008,7 +1167,19 @@ class SPPOTrainer(Trainer):
         train_eval: Literal["train", "eval"] = "train",
     ):
         """Compute the SPPO loss and other metrics for the given batch of inputs for train or test."""
+        # Debug: Check batch type in get_batch_loss_metrics
+        # Debug prints removed
+            
         metrics = {}
+
+        # Disallow fallback tokenization path to ensure dataset mapping is used
+        if (
+            isinstance(batch, dict)
+            and ("chosen_input_ids" not in batch or "rejected_input_ids" not in batch)
+        ):
+            raise ValueError(
+                "Batch missing tokenized fields ('chosen_input_ids'/'rejected_input_ids'). Ensure dataset was mapped with tokenize_row."
+            )
 
         (
             policy_chosen_logps,
@@ -1016,10 +1187,28 @@ class SPPOTrainer(Trainer):
             policy_chosen_logits,
             policy_rejected_logits,
         ) = self.concatenated_forward(model, batch)
-
-        chosen_probs = torch.tensor(batch["chosen_probs"], dtype=float, device=policy_chosen_logps.device)
-        chosen_probs_win = torch.tensor(batch["chosen_probs_win"], dtype=float, device=policy_chosen_logps.device)
-        chosen_probs_lose = torch.tensor(batch["chosen_probs_lose"], dtype=float, device=policy_chosen_logps.device)
+        # Handle optional probability annotations; default to 0.5 if not provided
+        batch_size = (
+            batch["chosen_labels"].shape[0]
+            if isinstance(batch.get("chosen_labels"), torch.Tensor)
+            else batch["chosen_input_ids"].shape[0]
+        )
+        _device = policy_chosen_logps.device
+        has_probs = "chosen_probs" in batch
+        has_probs_win = "chosen_probs_win" in batch
+        has_probs_lose = "chosen_probs_lose" in batch
+        if has_probs:
+            chosen_probs = torch.as_tensor(batch["chosen_probs"], dtype=torch.float, device=_device)
+        else:
+            chosen_probs = torch.full((batch_size,), 0.5, dtype=torch.float, device=_device)
+        if has_probs_win:
+            chosen_probs_win = torch.as_tensor(batch["chosen_probs_win"], dtype=torch.float, device=_device)
+        else:
+            chosen_probs_win = torch.full((batch_size,), 0.5, dtype=torch.float, device=_device)
+        if has_probs_lose:
+            chosen_probs_lose = torch.as_tensor(batch["chosen_probs_lose"], dtype=torch.float, device=_device)
+        else:
+            chosen_probs_lose = torch.full((batch_size,), 0.5, dtype=torch.float, device=_device)
         # if reference_chosen_logps and reference_rejected_logps in batch use them, otherwise use the reference model
         if "reference_chosen_logps" in batch and "reference_rejected_logps" in batch:
             reference_chosen_logps = batch["reference_chosen_logps"]
@@ -1064,6 +1253,27 @@ class SPPOTrainer(Trainer):
         metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
 
+        # Debug diagnostics to understand zero loss
+        if train_eval == "train":
+            with torch.no_grad():
+                metrics[f"{prefix}debug/has_probs_win"] = float(has_probs_win)
+                metrics[f"{prefix}debug/has_probs_lose"] = float(has_probs_lose)
+                if has_probs_win:
+                    metrics[f"{prefix}debug/mean_probs_win"] = chosen_probs_win.mean().cpu()
+                if has_probs_lose:
+                    metrics[f"{prefix}debug/mean_probs_lose"] = chosen_probs_lose.mean().cpu()
+                metrics[f"{prefix}debug/target_w_abs"] = (
+                    ((1.0 / self.beta) * (chosen_probs_win - 0.5)).abs().mean().cpu()
+                )
+                metrics[f"{prefix}debug/target_l_abs"] = (
+                    ((1.0 / self.beta) * (chosen_probs_lose - 0.5)).abs().mean().cpu()
+                )
+                metrics[f"{prefix}debug/logits_w_abs"] = (policy_chosen_logps - reference_chosen_logps).abs().mean().cpu()
+                metrics[f"{prefix}debug/logits_l_abs"] = (policy_rejected_logps - reference_rejected_logps).abs().mean().cpu()
+                metrics[f"{prefix}debug/prob_half_ratio"] = (
+                    ((chosen_probs_win == 0.5).float().mean() + (chosen_probs_lose == 0.5).float().mean()).div(2).cpu()
+                )
+
         return losses.mean(), metrics
 
     def compute_loss(
@@ -1071,7 +1281,31 @@ class SPPOTrainer(Trainer):
         model: Union[PreTrainedModel, nn.Module],
         inputs: Dict[str, Union[torch.Tensor, Any]],
         return_outputs=False,
+        num_items_in_batch=None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        # Debug: Check inputs keys on rank 0 when missing expected fields
+        try:
+            import os
+            is_rank0 = os.environ.get("LOCAL_RANK", "0") == "0"
+        except Exception:
+            is_rank0 = True
+        if is_rank0 and (not isinstance(inputs, dict) or ("chosen_input_ids" not in inputs)):
+            try:
+                keys = list(inputs.keys()) if isinstance(inputs, dict) else type(inputs)
+                print(f"[DEBUG] compute_loss received keys: {keys}")
+                print(f"[DEBUG] data_collator type: {type(self.data_collator)}")
+                if isinstance(inputs, str):
+                    snip = inputs[:120].replace("\n", " ")
+                    print(f"[DEBUG] compute_loss received raw string head: {snip}")
+            except Exception as _e:
+                print(f"[DEBUG] compute_loss key logging failed: {_e}")
+            
+        # Disallow automatic raw-string fallback: enforce pre-tokenized batches
+        if isinstance(inputs, str) or (isinstance(inputs, list) and inputs and isinstance(inputs[0], str)):
+            raise ValueError(
+                "Received raw string inputs in compute_loss. Ensure DataLoader uses the DPO collator and dataset is tokenized."
+            )
+            
         if not self.use_dpo_data_collator:
             warnings.warn(
                 "compute_loss is only implemented for DPODataCollatorWithPadding, and you passed a datacollator that is different than "
@@ -1090,20 +1324,95 @@ class SPPOTrainer(Trainer):
             return (loss, metrics)
         return loss
 
-    def get_batch_samples(self, model, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
+    def get_batch_samples(self, epoch_iterator, num_batches, device) -> Tuple[str, str]:
         """Generate samples from the model and reference model for the given batch of inputs."""
-
+        
+        # Get a batch from the epoch iterator
+        batch = next(epoch_iterator)
+        
+        # Check if batch needs tokenization
+        if isinstance(batch, str) or (isinstance(batch, dict) and "prompt" in batch and isinstance(batch["prompt"], str)):
+            # Batch contains raw text, need to tokenize it
+            # Debug print removed
+            if isinstance(batch, str):
+                # Single string, convert to dict format
+                batch = {"prompt": batch, "chosen": batch, "rejected": batch}
+            
+            # Use the same tokenization logic as the custom collator
+            prompt = batch["prompt"]
+            chosen = batch["chosen"]
+            rejected = batch["rejected"]
+            
+            _pt = self._tokenizer(prompt, add_special_tokens=False)
+            prompt_tokens = {f"prompt_{k}": v for k, v in _pt.items()}
+            _pt = self._tokenizer(prompt, add_special_tokens=False)
+            prompt_tokens = {f"prompt_{k}": v for k, v in _pt.items()}
+            
+            chosen_tokens = self._tokenizer(chosen, add_special_tokens=False)
+            rejected_tokens = self._tokenizer(rejected, add_special_tokens=False)
+            
+            # Add BOS token
+            prompt_tokens["prompt_input_ids"] = [self._tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
+            chosen_tokens["input_ids"] = [self._tokenizer.bos_token_id] + chosen_tokens["input_ids"]
+            rejected_tokens["input_ids"] = [self._tokenizer.bos_token_id] + rejected_tokens["input_ids"]
+            
+            prompt_tokens["prompt_attention_mask"] = [1] + prompt_tokens["prompt_attention_mask"]
+            chosen_tokens["attention_mask"] = [1] + chosen_tokens["attention_mask"]
+            rejected_tokens["attention_mask"] = [1] + rejected_tokens["attention_mask"]
+            
+            # Add EOS token
+            chosen_tokens["input_ids"].append(self._tokenizer.eos_token_id)
+            chosen_tokens["attention_mask"].append(1)
+            rejected_tokens["input_ids"].append(self._tokenizer.eos_token_id)
+            rejected_tokens["attention_mask"].append(1)
+            
+            # Create sequence tokens
+            chosen_sequence_tokens = {
+                k: prompt_tokens[f"prompt_{k}"] + chosen_tokens[k] for k in ["input_ids", "attention_mask"]
+            }
+            rejected_sequence_tokens = {
+                k: prompt_tokens[f"prompt_{k}"] + rejected_tokens[k] for k in ["input_ids", "attention_mask"]
+            }
+            
+            # Create labels
+            chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
+            chosen_sequence_tokens["labels"][:len(prompt_tokens["prompt_input_ids"])] = [self.label_pad_token_id] * len(prompt_tokens["prompt_input_ids"])
+            
+            rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
+            rejected_sequence_tokens["labels"][:len(prompt_tokens["prompt_input_ids"])] = [self.label_pad_token_id] * len(prompt_tokens["prompt_input_ids"])
+            
+            # Create the batch
+            batch = {}
+            for k, toks in {
+                "chosen_": chosen_sequence_tokens,
+                "rejected_": rejected_sequence_tokens,
+                "": prompt_tokens,
+            }.items():
+                for type_key, tokens in toks.items():
+                    if type_key == "token_type_ids":
+                        continue
+                    batch[f"{k}{type_key}"] = torch.tensor([tokens])
+        
+        batch = self._prepare_inputs(batch)
+        
+        # Ensure input sequences are within model limits to prevent CUDA errors
+        max_input_length = min(self.max_length, 1024)  # GPT-2 context limit
+        if batch["prompt_input_ids"].shape[1] > max_input_length:
+            batch["prompt_input_ids"] = batch["prompt_input_ids"][:, :max_input_length]
+            batch["prompt_attention_mask"] = batch["prompt_attention_mask"][:, :max_input_length]
+        
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
         # the torch cuda amp context manager as some hidden states are silently casted to full precision.
         generate_context_manager = nullcontext if not self._peft_has_been_casted_to_bf16 else torch.cuda.amp.autocast
 
         with generate_context_manager():
-            policy_output = model.generate(
+            # Use max_new_tokens instead of max_length to prevent CUDA errors
+            policy_output = self.model.generate(
                 input_ids=batch["prompt_input_ids"],
                 attention_mask=batch["prompt_attention_mask"],
-                max_length=self.max_length,
+                max_new_tokens=256,  # Generate at most 256 new tokens
                 do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
+                pad_token_id=self._tokenizer.pad_token_id,
             )
 
             # if reference_output in batch use that otherwise use the reference model
@@ -1117,7 +1426,7 @@ class SPPOTrainer(Trainer):
                             attention_mask=batch["prompt_attention_mask"],
                             max_length=self.max_length,
                             do_sample=True,
-                            pad_token_id=self.tokenizer.pad_token_id,
+                            pad_token_id=self._tokenizer.pad_token_id,
                         )
                 else:
                     reference_output = self.ref_model.generate(
@@ -1125,14 +1434,66 @@ class SPPOTrainer(Trainer):
                         attention_mask=batch["prompt_attention_mask"],
                         max_length=self.max_length,
                         do_sample=True,
-                        pad_token_id=self.tokenizer.pad_token_id,
+                        pad_token_id=self._tokenizer.pad_token_id,
                     )
 
-        policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
-        policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
+        policy_output = pad_to_length(policy_output, self.max_length, self._tokenizer.pad_token_id)
+        policy_output_decoded = self._tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
-        reference_output = pad_to_length(reference_output, self.max_length, self.tokenizer.pad_token_id)
-        reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
+        reference_output = pad_to_length(reference_output, self.max_length, self._tokenizer.pad_token_id)
+        reference_output_decoded = self._tokenizer.batch_decode(reference_output, skip_special_tokens=True)
+
+        return policy_output_decoded, reference_output_decoded
+
+    def _generate_batch_samples(self, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
+        """Generate samples from the model and reference model for the given batch of inputs."""
+        
+        # Ensure input sequences are within model limits to prevent CUDA errors
+        max_input_length = min(self.max_length, 1024)  # GPT-2 context limit
+        if batch["prompt_input_ids"].shape[1] > max_input_length:
+            batch["prompt_input_ids"] = batch["prompt_input_ids"][:, :max_input_length]
+            batch["prompt_attention_mask"] = batch["prompt_attention_mask"][:, :max_input_length]
+        
+        # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
+        # the torch cuda amp context manager as some hidden states are silently casted to full precision.
+        generate_context_manager = nullcontext if not self._peft_has_been_casted_to_bf16 else torch.cuda.amp.autocast
+
+        with generate_context_manager():
+            policy_output = self.model.generate(
+                input_ids=batch["prompt_input_ids"],
+                attention_mask=batch["prompt_attention_mask"],
+                max_length=self.max_length,
+                do_sample=True,
+                pad_token_id=self._tokenizer.pad_token_id,
+            )
+
+            # if reference_output in batch use that otherwise use the reference model
+            if "reference_output" in batch:
+                reference_output = batch["reference_output"]
+            else:
+                if self.ref_model is None:
+                    with self.null_ref_context():
+                        reference_output = self.model.generate(
+                            input_ids=batch["prompt_input_ids"],
+                            attention_mask=batch["prompt_attention_mask"],
+                            max_length=self.max_length,
+                            do_sample=True,
+                            pad_token_id=self._tokenizer.pad_token_id,
+                        )
+                else:
+                    reference_output = self.ref_model.generate(
+                        input_ids=batch["prompt_input_ids"],
+                        attention_mask=batch["prompt_attention_mask"],
+                        max_length=self.max_length,
+                        do_sample=True,
+                        pad_token_id=self._tokenizer.pad_token_id,
+                    )
+
+        policy_output = pad_to_length(policy_output, self.max_length, self._tokenizer.pad_token_id)
+        policy_output_decoded = self._tokenizer.batch_decode(policy_output, skip_special_tokens=True)
+
+        reference_output = pad_to_length(reference_output, self.max_length, self._tokenizer.pad_token_id)
+        reference_output_decoded = self._tokenizer.batch_decode(reference_output, skip_special_tokens=True)
 
         return policy_output_decoded, reference_output_decoded
 
@@ -1203,10 +1564,16 @@ class SPPOTrainer(Trainer):
 
             # Use dataloader.dataset.select to get the random batch without iterating over the DataLoader
             random_batch_dataset = dataloader.dataset.select(random_indices)
-            random_batch = self.data_collator(random_batch_dataset)
+            random_features = [random_batch_dataset[i] for i in range(len(random_batch_dataset))]
+            random_batch = self.data_collator(random_features)
             random_batch = self._prepare_inputs(random_batch)
 
-            policy_output_decoded, ref_output_decoded = self.get_batch_samples(self.model, random_batch)
+            policy_output_decoded, ref_output_decoded = self._generate_batch_samples(random_batch)
+
+            # Decode prompts for display
+            decoded_prompts = self._tokenizer.batch_decode(
+                random_batch["prompt_input_ids"], skip_special_tokens=True
+            )
 
             self.log(
                 {
@@ -1215,7 +1582,7 @@ class SPPOTrainer(Trainer):
                         rows=[
                             [prompt, pol[len(prompt) :], ref[len(prompt) :]]
                             for prompt, pol, ref in zip(
-                                random_batch["prompt"], policy_output_decoded, ref_output_decoded
+                                decoded_prompts, policy_output_decoded, ref_output_decoded
                             )
                         ],
                     )
@@ -1230,13 +1597,13 @@ class SPPOTrainer(Trainer):
 
         return initial_output
 
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         """
         Log `logs` on the various objects watching training, including stored metrics.
 
         Args:
-            logs (`Dict[str, float]`):
-                The values to log.
+            logs (`Dict[str, float]`): The values to log.
+            start_time (`Optional[float]`): Training loop start time (ignored, for API compatibility).
         """
         # logs either has 'loss' or 'eval_loss'
         train_eval = "train" if "loss" in logs else "eval"

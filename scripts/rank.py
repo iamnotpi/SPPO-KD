@@ -5,9 +5,10 @@ import argparse
 import llm_blender
 import os
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 import torch
 from tqdm import tqdm
+from vllm import LLM, SamplingParams
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -26,6 +27,7 @@ def parse_arguments():
     parser.add_argument("--teacher_model", type=str, default="mistralai/Mistral-7B-Instruct-v0.2", help="Teacher model for scoring (HuggingFace model)")
     parser.add_argument("--scoring_prompt_template", type=str, default=None, help="Path to scoring prompt template")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for teacher LLM scoring")
+    parser.add_argument("--tensor_parallel_size", type=int, default=1, help="Number of GPUs for tensor parallelism in vLLM")
     
     parser.add_argument("--bt_conversion_method", type=str, default="bradley_terry_mle",
                        choices=["bradley_terry_mle", "score_difference", "elo_simulation", "percentile_ranking"],
@@ -121,8 +123,8 @@ def simulate_pairwise_from_scores(absolute_scores, method="bradley_terry_mle"):
 
 
 
-def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", max_length=1024, batch_size=4):
-    """Score responses using batched contextual scoring for efficiency."""
+def score_with_teacher_vllm(prompts, all_responses, llm, max_length=1024, batch_size=4):
+    """Score responses using vLLM for efficient batched scoring."""
     import re
     
     all_scores = []
@@ -142,28 +144,18 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
         
         if not batch_scoring_prompts:
             continue
-            
-        inputs = tokenizer(
-            batch_scoring_prompts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=max_length
-        ).to(device)
         
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=10,
-                temperature=0.1,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
-            )
+        sampling_params = SamplingParams(
+            temperature=0.1,
+            max_tokens=10,
+            stop=None
+        )
+        
+        outputs = llm.generate(batch_scoring_prompts, sampling_params)
         
         batch_scores = []
-        for j, (batch_idx, response_idx) in enumerate(batch_indices):
-            input_length = inputs.input_ids[j].shape[0]
-            generated_text = tokenizer.decode(outputs[j][input_length:], skip_special_tokens=True)
+        for j, output in enumerate(outputs):
+            generated_text = output.outputs[0].text
             
             score_match = re.search(r'(\d+\.?\d*)', generated_text)
             if score_match:
@@ -190,24 +182,23 @@ def score_with_teacher(prompts, all_responses, model, tokenizer, device="cuda", 
 
 
 
-def score_with_teacher_llm(prompts, candidates, teacher_model, batch_size=4, template_path=None, bt_method="bradley_terry_mle"):
-    """Score responses using batched contextual scoring then convert to Bradley-Terry format."""
-    print(f"Scoring {len(prompts)} prompts with batched contextual scoring using {teacher_model}")
-    print(f"Batch size: {batch_size}, Bradley-Terry conversion method: {bt_method}")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def score_with_teacher_llm(prompts, candidates, teacher_model, batch_size=4, template_path=None, bt_method="bradley_terry_mle", tensor_parallel_size=1):
+    """Score responses using vLLM for efficient batched scoring then convert to Bradley-Terry format."""
+    print(f"Scoring {len(prompts)} prompts with vLLM batched scoring using {teacher_model}")
+    print(f"Batch size: {batch_size}, Bradley-Terry conversion method: {bt_method}, Tensor parallel size: {tensor_parallel_size}")
     
     try:
-        model = AutoModelForCausalLM.from_pretrained(teacher_model, torch_dtype=torch.float16).to(device)
-        tokenizer = AutoTokenizer.from_pretrained(teacher_model)
-        tokenizer.pad_token = tokenizer.eos_token
+        llm = LLM(
+            model=teacher_model,
+            tensor_parallel_size=tensor_parallel_size,
+            trust_remote_code=True,
+            max_model_len=2048
+        )
     except Exception as e:
-        print(f"Error loading model {teacher_model}: {e}")
+        print(f"Error loading model {teacher_model} with vLLM: {e}")
         raise
     
-    model.eval()
-    
-    absolute_scores_list = score_with_teacher(prompts, candidates, model, tokenizer, device, batch_size=batch_size)
+    absolute_scores_list = score_with_teacher_vllm(prompts, candidates, llm, batch_size=batch_size)
     
     all_scores = []
     for absolute_scores in absolute_scores_list:
@@ -218,7 +209,7 @@ def score_with_teacher_llm(prompts, candidates, teacher_model, batch_size=4, tem
 
 
 def ranking(args, prompts, candidates):
-    """Rank responses using either PairRM or teacher LLM."""
+    """Rank responses using either PairRM or teacher LLM with vLLM."""
     if args.use_teacher_llm:
         scores = score_with_teacher_llm(
             prompts,
@@ -226,7 +217,8 @@ def ranking(args, prompts, candidates):
             args.teacher_model,
             args.batch_size,
             args.scoring_prompt_template,
-            getattr(args, 'bt_conversion_method', 'bradley_terry_mle')
+            getattr(args, 'bt_conversion_method', 'bradley_terry_mle'),
+            args.tensor_parallel_size
         )
     else:
         blender = llm_blender.Blender()
@@ -248,24 +240,48 @@ def split_prompts(prompts, frac_len, data_frac):
 
 
 def apply_template(text, tokenizer):
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": text}, {"role": "assistant", "content": "None"}],
-        tokenize=False, add_generate_prompt=True
-    ).split("None")[0]
+    if hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}, {"role": "assistant", "content": "None"}],
+            tokenize=False, add_generate_prompt=True
+        ).split("None")[0]
+    else:
+        return text
 
 
 
 def main(args):
-    data = load_dataset(args.prompts, split="train")
+    if args.prompts.endswith('.jsonl'):
+        from datasets import Dataset
+        data_list = []
+        with open(args.prompts, 'r', encoding='utf-8') as f:
+            for line in f:
+                item = json.loads(line.strip())
+                data_list.append(item)
+        data = Dataset.from_list(data_list)
 
-    if "mistral" in args.model.lower():
-        tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
-    elif "llama-3" in args.model.lower():
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-    elif "gemma-2" in args.model.lower():
-        tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-9b-it")
+    if args.use_teacher_llm and args.teacher_model:
+        if "qwen" in args.teacher_model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-1.8B-Chat")
+        elif "mistral" in args.teacher_model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+        elif "llama" in args.teacher_model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+        elif "gemma" in args.teacher_model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-9b-it")
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
     else:
-        raise ValueError("Must contain model name in the dataset name. Supported models: Mistral/Llama-3")
+        if "mistral" in args.model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+        elif "llama-3" in args.model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+        elif "gemma-2" in args.model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-9b-it")
+        elif "gpt2" in args.model.lower():
+            tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        else:
+            raise ValueError("Must contain model name in the model argument. Supported models: Mistral/Llama-3/Gemma-2/GPT-2")
 
     tokenizer.pad_token = tokenizer.eos_token
 

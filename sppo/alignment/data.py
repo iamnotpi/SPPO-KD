@@ -5,8 +5,9 @@
 import os
 from typing import List, Literal, Optional
 
-from datasets import DatasetDict, concatenate_datasets, load_dataset, load_from_disk
+from datasets import DatasetDict, concatenate_datasets, load_dataset, load_from_disk, Dataset
 from datasets.builder import DatasetGenerationError
+from datasets.exceptions import DatasetNotFoundError
 
 from .configs import DataArguments
 
@@ -133,9 +134,17 @@ def mix_datasets(dataset_mixer: dict, splits: Optional[List[str]] = None, shuffl
             try:
                 # Try first if dataset on a Hub repo
                 dataset = load_dataset(ds, split=split)
-            except DatasetGenerationError:
-                # If not, check local dataset
-                dataset = load_from_disk(os.path.join(ds, split))
+            except (DatasetGenerationError, DatasetNotFoundError):
+                try:
+                    dataset = load_from_disk(os.path.join(ds, split))
+                except (FileNotFoundError, OSError):
+                    import pandas as pd
+                    parquet_file = os.path.join(ds, f"{split}.parquet")
+                    if os.path.exists(parquet_file):
+                        df = pd.read_parquet(parquet_file)
+                        dataset = Dataset.from_pandas(df)
+                    else:
+                        raise FileNotFoundError(f"Could not find dataset at {ds} with split {split}")
 
             if "train" in split:
                 raw_train_datasets.append(dataset)

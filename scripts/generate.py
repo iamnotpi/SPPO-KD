@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
@@ -42,10 +42,13 @@ def apply_template(text, tokenizer, knowledge_distillation=False):
     if knowledge_distillation:
         return text
     else:
-        return tokenizer.apply_chat_template(
-            [{"role": "user", "content": text}, {"role": "assistant", "content": "None"}],
-            tokenize=False, add_generate_prompt=True
-        ).split("None")[0]
+        if hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}, {"role": "assistant", "content": "None"}],
+                tokenize=False, add_generate_prompt=True
+            ).split("None")[0]
+        else:
+            return text
 
 
 def split_prompts(prompts, frac_len, data_frac):
@@ -79,6 +82,8 @@ def main():
 
     if "gpt2" in model_path.lower():
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    elif "qwen" in model_path.lower():
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-1.8B-Chat")
     elif "mistral" in model_path.lower():
         tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
     elif "llama-3" in model_path.lower():
@@ -88,8 +93,8 @@ def main():
     else:
         raise ValueError("Model not supported")
     tokenizer.pad_token = tokenizer.eos_token
-    # import pdb
-    # pdb.set_trace()
+
+    
     llm = LLM(
         model=model_path,
         tensor_parallel_size=args.world_size,
@@ -106,8 +111,8 @@ def main():
     for p in range(pairs):
         set_seed(p * 50)
         sampling_params = SamplingParams(
-            temperature=0.7,
-            top_p=0.9,
+            temperature=1.0,
+            top_p=1.0,
             max_tokens=args.maxlen,
             seed=p * 50,
         )

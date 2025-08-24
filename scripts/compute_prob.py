@@ -21,7 +21,13 @@ def parse_arguments():
 def from_ranks(args):
     num_gpu = args.num_gpu
     pairs = args.pairs
-    data = load_dataset(args.prompts, split="train")
+
+    data_list = []
+    with open(args.prompts, 'r', encoding='utf-8') as f:
+        for line in f:
+            item = json.loads(line.strip())
+            data_list.append(item)
+    data = Dataset.from_list(data_list)
     print(f"Length of dataset: {len(data)}")
 
     scores = [0 for _ in range(len(data))]
