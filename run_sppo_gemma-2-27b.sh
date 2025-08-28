@@ -7,7 +7,7 @@ for i in $(seq 1 $iter_num); do
         MODEL=$OUTPUT_DIR
     fi
     OUTPUT_DIR="checkpoints/Gemma-2-27B-SPPO-It-Iter${i}"
-    PROMPT="UCLA-AGI/data-mistral-7b-instruct-sppo-iter${i}"
+    PROMPT="${HF_ORG:-UCLA-AGI}/data-mistral-7b-instruct-sppo-iter${i}"
     OUT="data-gemma-2-27b-it-sppo-iter${i}"
     echo "runing epoch $i"
     DATASET="synthetic_data_gemma-2-27b-it-sppo-iter${i}_score"

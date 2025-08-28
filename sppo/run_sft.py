@@ -121,15 +121,33 @@ def main():
     )
     quantization_config = get_quantization_config(model_args)
 
+    model_supports_flash_attention = False
+    if model_args.use_flash_attention_2:
+        try:
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(
+                model_args.model_name_or_path,
+                revision=model_args.model_revision,
+                trust_remote_code=model_args.trust_remote_code
+            )
+            # Flash attention is supported by these model types
+            supported_model_types = ["llama", "mistral", "gpt_neox", "mixtral", "qwen2"]
+            model_supports_flash_attention = config.model_type in supported_model_types
+        except Exception:
+            # If we can't load config, assume flash attention is not supported
+            model_supports_flash_attention = False
+
     model_kwargs = dict(
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
-        use_flash_attention_2=model_args.use_flash_attention_2,
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
     )
+
+    if model_supports_flash_attention:
+        model_kwargs["use_flash_attention_2"] = True
     logger.info("*** Model loaded! ***")
 
     ########################

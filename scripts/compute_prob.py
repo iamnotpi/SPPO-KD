@@ -11,17 +11,41 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="generated/iter1")
     parser.add_argument("--pairs", type=int, default=5)
-    parser.add_argument("--prompts", type=str, default="UCLA-AGI/data-mistral-7b-instruct-sppo-iter1")
+    parser.add_argument("--prompts", type=str, default=os.environ.get("HF_PROMPTS_DATASET", "UCLA-AGI/data-mistral-7b-instruct-sppo-iter1"))
     parser.add_argument("--frac_len", type=int, default=0)
     parser.add_argument("--num_gpu", type=int, default=8)
-    parser.add_argument("--org", type=str, default="UCLA-AGI")
+    parser.add_argument("--org", type=str, default=os.environ.get("HF_ORG", "UCLA-AGI"))
     parser.add_argument("--gpu_ids", type=str, default=None)
     return parser.parse_args()
 
 def from_ranks(args):
     num_gpu = args.num_gpu
     pairs = args.pairs
-    data = load_dataset(args.prompts, split="train")
+    # Support local folders/files or HF datasets
+    if os.path.isdir(args.prompts):
+        candidates = [
+            "train.jsonl", "train.json", "data.jsonl", "data.json",
+            "train.parquet", "data.parquet"
+        ]
+        found = None
+        for name in candidates:
+            p = os.path.join(args.prompts, name)
+            if os.path.exists(p):
+                found = p
+                break
+        if found is None:
+            raise FileNotFoundError(f"No supported prompt file found in {args.prompts}")
+        if found.endswith('.jsonl') or found.endswith('.json'):
+            data = load_dataset('json', data_files=found, split='train')
+        elif found.endswith('.parquet'):
+            data = load_dataset('parquet', data_files=found, split='train')
+    else:
+        if args.prompts.endswith('.jsonl') or args.prompts.endswith('.json'):
+            data = load_dataset('json', data_files=args.prompts, split='train')
+        elif args.prompts.endswith('.parquet'):
+            data = load_dataset('parquet', data_files=args.prompts, split='train')
+        else:
+            data = load_dataset(args.prompts, split="train")
     print(f"Length of dataset: {len(data)}")
 
     scores = [0 for _ in range(len(data))]

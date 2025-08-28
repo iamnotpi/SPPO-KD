@@ -8,7 +8,7 @@ for i in $(seq 1 $iter_num); do
         MODEL=$OUTPUT_DIR
     fi
     OUTPUT_DIR="checkpoints/Mistral-7B-Instruct-SPPO-Iter${i}"
-    PROMPT="UCLA-AGI/data-mistral-7b-instruct-sppo-iter${i}"
+    PROMPT="${HF_ORG:-UCLA-AGI}/data-mistral-7b-instruct-sppo-iter${i}"
     OUT="data-mistral-7b-instruct-sppo-iter${i}"
 
     bash scripts/generate.sh --model $MODEL --prompt $PROMPT --out_path $OUT
